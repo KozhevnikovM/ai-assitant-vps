@@ -1,0 +1,30 @@
+---
+- name: Provision idle-shutdown + Telegram notify
+  hosts: dev_vps
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Install idle-shutdown script
+      ansible.builtin.copy:
+        src: ../scripts/idle-shutdown.sh
+        dest: /home/mike/infra/idle-shutdown.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install Telegram notify secret file
+      ansible.builtin.template:
+        src: templates/telegram-notify.env.j2
+        dest: /etc/telegram-notify.env
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Install idle-shutdown cron job
+      ansible.builtin.cron:
+        name: idle-shutdown check
+        minute: "*"
+        job: /home/mike/infra/idle-shutdown.sh
+        user: root
