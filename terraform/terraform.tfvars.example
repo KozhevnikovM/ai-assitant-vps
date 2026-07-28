@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars (gitignored) and fill in real values.
+# terraform.tfvars is never committed -- it holds the bot token and your
+# chat ID, neither of which belong in git history.
+
+# GCP project hosting the ai-dev-vps instance. No default -- required.
+project_id = "your-gcp-project-id"
+
+# Your numeric Telegram chat ID (from @userinfobot). No default -- required.
+allowed_chat_id = "123456789"
+
+# Bot token from @BotFather, e.g. "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11".
+# No default -- required, and sensitive (Terraform won't echo it in plan output).
+telegram_bot_token = "your-telegram-bot-token"
+
+# Uncomment and adjust only if these differ from the plan.md defaults.
+# region        = "us-central1"
+# zone          = "us-central1-a"
+# instance_name = "ai-dev-vps"

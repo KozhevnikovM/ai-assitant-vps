@@ -391,8 +391,14 @@ Values and calls only you can make before this ships:
 - [ ] GCP project ID, region, and zone for `ai-dev-vps`
 - [ ] Your numeric Telegram chat ID (get it from `@userinfobot` or the
       bot's own update log)
-- [ ] Whether the existing auto-shutdown cron on the VM should also notify
+- [x] Whether the existing auto-shutdown cron on the VM should also notify
       Telegram when it fires, so the two control paths don't feel
-      disconnected
-- [ ] Whether `terraform.tfvars` / state will live somewhere with a remote
-      backend, or stay local for now
+      disconnected — **resolved: yes**, see
+      [gce-admin-prep.md §6](gce-admin-prep.md#6-wire-the-auto-shutdown-cron-to-notify-telegram)
+      for the pattern (a local root-only secret file, not a Secret
+      Manager call, since the VM's default service account lacks the
+      OAuth scope for that without a restart).
+- [x] Whether `terraform.tfvars` / state will live somewhere with a remote
+      backend, or stay local for now — **resolved: local state** for now.
+      The scaffold in `terraform/` uses no backend block, so state is a
+      local `terraform.tfstate` file (gitignored).
