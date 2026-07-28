@@ -145,48 +145,19 @@ fill in `terraform.tfvars` (which stays out of git):
 
 ## 6. Wire the auto-shutdown cron to notify Telegram
 
-The VM's existing idle-shutdown script isn't managed by this repo's
-Terraform, so this is a manual edit you make directly on the instance —
-there's no automated step for it.
+The idle-shutdown script and its setup steps live in this repo now:
+[`scripts/idle-shutdown.sh`](../../scripts/idle-shutdown.sh) and
+[`scripts/telegram-notify.env.example`](../../scripts/telegram-notify.env.example).
+Follow [server-setup.md](server-setup.md) to install both on the instance
+— it isn't managed by Terraform, so it's a manual, one-time step per VM.
 
-The natural way to do this would be to have the script call Secret
-Manager for the bot token, but most default Compute Engine service
-accounts are attached with legacy OAuth scopes (`devstorage.read_only`,
-`logging.write`, etc.) rather than `cloud-platform`, and Secret Manager
-calls need `cloud-platform`. Widening the scope means detaching and
-reattaching it, which requires stopping the instance — too disruptive for
-this. Simpler alternative: a second, VM-local copy of the bot token in a
-root-only file.
-
-1. Create `/etc/telegram-notify.env`, root-owned and unreadable by anyone
-   else:
-   ```
-   sudo install -m 600 -o root -g root /dev/null /etc/telegram-notify.env
-   sudo tee /etc/telegram-notify.env >/dev/null <<'EOF'
-   TELEGRAM_BOT_TOKEN=<same token you gave Terraform as telegram_bot_token>
-   TELEGRAM_CHAT_ID=<same value you gave Terraform as allowed_chat_id>
-   EOF
-   ```
-2. Add this function to the shutdown script, and call it right before the
-   line that actually shuts the instance down:
-   ```bash
-   notify_telegram() {
-       [ -f /etc/telegram-notify.env ] || return 0
-       . /etc/telegram-notify.env
-       curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-           -d chat_id="${TELEGRAM_CHAT_ID}" \
-           -d text="🔴 ai-dev-vps auto-shutdown: idle timeout reached" \
-           >/dev/null 2>&1
-   }
-   ```
-   Calling it right before shutdown (not after) matters — once the
-   instance is going down there's no guarantee a background process
-   finishes its HTTP request.
-
-This does mean the bot token now lives in two places: Secret Manager (for
-the Cloud Function) and this file (for the cron job). That duplication is
-the accepted tradeoff for not having to restart the instance to widen its
-access scopes.
+Short version of the design: the script notifies Telegram from a
+root-only local secret file rather than calling Secret Manager directly,
+because most default Compute Engine service accounts have legacy OAuth
+scopes (`devstorage.read_only`, `logging.write`, etc.) rather than
+`cloud-platform`, and widening that means stopping and restarting the
+instance. The tradeoff is a second copy of the bot token living outside
+Secret Manager. See server-setup.md for the full rationale and steps.
 
 ---
 
