@@ -16,11 +16,13 @@ ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
+POWER_ON_LABEL = "Power On \U0001F7E2"
+POWER_OFF_LABEL = "Power Off \U0001F534"
+
 KEYBOARD = {
-    "inline_keyboard": [[
-        {"text": "Power On \U0001F7E2", "callback_data": "power_on"},
-        {"text": "Power Off \U0001F534", "callback_data": "power_off"},
-    ]]
+    "keyboard": [[{"text": POWER_ON_LABEL}, {"text": POWER_OFF_LABEL}]],
+    "resize_keyboard": True,
+    "is_persistent": True,
 }
 
 
@@ -36,30 +38,28 @@ def telegram_webhook(request):
 
     data = request.get_json(silent=True) or {}
 
-    if "callback_query" in data:
-        return _handle_callback(data["callback_query"])
-
     if "message" in data and "text" in data["message"]:
         return _handle_message(data["message"])
 
     return "OK", 200
 
 
-def _handle_callback(callback_query):
-    chat_id = callback_query["message"]["chat"]["id"]
+def _handle_message(message):
+    chat_id = message["chat"]["id"]
     if chat_id != ALLOWED_CHAT_ID:
         return "Forbidden", 403
 
-    requests.post(
-        API_URL + "answerCallbackQuery",
-        json={"callback_query_id": callback_query["id"]},
-        timeout=5,
-    )
+    text = message["text"]
 
-    action = callback_query.get("data")
-    if action == "power_on":
+    if text in ("/start", "/control"):
+        requests.post(
+            API_URL + "sendMessage",
+            json={"chat_id": chat_id, "text": "Server Control Panel:", "reply_markup": KEYBOARD},
+            timeout=5,
+        )
+    elif text == POWER_ON_LABEL:
         _run_power_action(compute_client.start, chat_id, "\U0001F7E2 Booting up AI VPS...")
-    elif action == "power_off":
+    elif text == POWER_OFF_LABEL:
         _run_power_action(compute_client.stop, chat_id, "\U0001F534 Shutting down AI VPS...")
 
     return "OK", 200
@@ -73,18 +73,3 @@ def _run_power_action(method, chat_id, ok_text):
         text = f"⚠️ Compute API error: {exc.message}"
 
     requests.post(API_URL + "sendMessage", json={"chat_id": chat_id, "text": text}, timeout=5)
-
-
-def _handle_message(message):
-    chat_id = message["chat"]["id"]
-    if chat_id != ALLOWED_CHAT_ID:
-        return "Forbidden", 403
-
-    if message["text"] in ("/start", "/control"):
-        requests.post(
-            API_URL + "sendMessage",
-            json={"chat_id": chat_id, "text": "Server Control Panel:", "reply_markup": KEYBOARD},
-            timeout=5,
-        )
-
-    return "OK", 200
