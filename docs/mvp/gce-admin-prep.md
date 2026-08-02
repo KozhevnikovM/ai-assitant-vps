@@ -1,8 +1,10 @@
 # GCE admin prep — before we run `terraform apply`
 
-Handoff doc for whoever administers the GCP project. Nothing here touches
-the `ai-dev-vps` instance itself — it's all one-time project setup so the
-Terraform in [plan.md](plan.md) applies without surprises.
+Handoff doc for whoever administers the GCP project. Most of this is
+one-time project setup so the Terraform in [plan.md](plan.md) applies
+without surprises — the one exception is §6, where `terraform apply`
+itself now reaches the `ai-dev-vps` instance over an IAP-tunneled SSH
+connection to provision it (see [server-setup.md](server-setup.md)).
 
 ---
 
@@ -55,7 +57,7 @@ gcloud iam roles create terraformTelegramWebhookDeployer \
   --title="Terraform - telegram webhook deployer" \
   --description="One-time apply role for the telegram-boot-function stack" \
   --stage=GA \
-  --permissions=resourcemanager.projects.get,resourcemanager.projects.getIamPolicy,resourcemanager.projects.setIamPolicy,iam.serviceAccounts.create,iam.serviceAccounts.get,iam.serviceAccounts.delete,iam.serviceAccounts.list,iam.serviceAccounts.actAs,secretmanager.secrets.create,secretmanager.secrets.get,secretmanager.secrets.delete,secretmanager.secrets.list,secretmanager.secrets.getIamPolicy,secretmanager.secrets.setIamPolicy,secretmanager.versions.add,secretmanager.versions.get,secretmanager.versions.list,secretmanager.versions.destroy,storage.buckets.create,storage.buckets.get,storage.buckets.delete,storage.buckets.list,storage.objects.create,storage.objects.get,storage.objects.delete,storage.objects.list,cloudfunctions.functions.create,cloudfunctions.functions.get,cloudfunctions.functions.update,cloudfunctions.functions.delete,cloudfunctions.functions.list,cloudfunctions.operations.get,run.services.get,run.services.list,run.services.getIamPolicy,run.services.setIamPolicy
+  --permissions=resourcemanager.projects.get,resourcemanager.projects.getIamPolicy,resourcemanager.projects.setIamPolicy,iam.serviceAccounts.create,iam.serviceAccounts.get,iam.serviceAccounts.delete,iam.serviceAccounts.list,iam.serviceAccounts.actAs,secretmanager.secrets.create,secretmanager.secrets.get,secretmanager.secrets.delete,secretmanager.secrets.list,secretmanager.secrets.getIamPolicy,secretmanager.secrets.setIamPolicy,secretmanager.versions.add,secretmanager.versions.get,secretmanager.versions.list,secretmanager.versions.destroy,storage.buckets.create,storage.buckets.get,storage.buckets.delete,storage.buckets.list,storage.objects.create,storage.objects.get,storage.objects.delete,storage.objects.list,cloudfunctions.functions.create,cloudfunctions.functions.get,cloudfunctions.functions.update,cloudfunctions.functions.delete,cloudfunctions.functions.list,cloudfunctions.operations.get,run.services.get,run.services.list,run.services.getIamPolicy,run.services.setIamPolicy,compute.instances.get,iap.tunnelInstances.accessViaIAP
 ```
 
 If `apply` should run as a dedicated identity rather than a human account
@@ -105,12 +107,17 @@ using the dedicated deployer service account above).
 Notes on the permission list:
 
 - `resourcemanager.projects.setIamPolicy` is what grants the
-  condition-scoped `compute.instanceAdmin.v1` binding — no
-  `compute.*` permission is needed for `apply` itself, since Terraform
-  never calls the Compute API directly, only sets IAM on the project.
+  condition-scoped `compute.instanceAdmin.v1` binding — Terraform's own
+  resource graph never calls the Compute API directly, only sets IAM on
+  the project.
 - `iam.serviceAccounts.actAs` lets the deployer impersonate the new
   function service account during deployment; drop it if deploys ever
   start failing with an impersonation error and add it back.
+- `compute.instances.get` and `iap.tunnelInstances.accessViaIAP` are for
+  `null_resource.vm_setup` (§6 / server-setup.md), *not* the rest of the
+  stack — that's `terraform apply` itself reaching the VM over an
+  IAP-tunneled SSH connection to run Ansible, the one place this stack
+  touches the Compute API at all.
 - Nothing from `cloudbuild.googleapis.com` or
   `artifactregistry.googleapis.com` is listed — the underlying build that
   Cloud Functions Gen2 triggers runs under Google's own service agent, not
@@ -143,13 +150,19 @@ fill in `terraform.tfvars` (which stays out of git):
 
 ---
 
-## 6. Wire the auto-shutdown cron to notify Telegram
+## 6. Auto-shutdown cron + Telegram notify
 
-The idle-shutdown script and its setup steps live in this repo now:
-[`scripts/idle-shutdown.sh`](../../scripts/idle-shutdown.sh) and
-[`scripts/telegram-notify.env.example`](../../scripts/telegram-notify.env.example).
-Follow [server-setup.md](server-setup.md) to install both on the instance
-— it isn't managed by Terraform, so it's a manual, one-time step per VM.
+`terraform apply` now installs this automatically —
+`terraform/vm_setup.tf`'s `null_resource.vm_setup` runs
+[`ansible/playbook.yml`](../../ansible/playbook.yml) against the instance
+over an IAP-tunneled SSH connection (via
+[`scripts/ansible-provision.sh`](../../scripts/ansible-provision.sh)), no
+manual step required. See [server-setup.md](server-setup.md) for the full
+design and how to run it standalone if you need to debug it.
+
+This is why the custom role in §3 includes `compute.instances.get` and
+`iap.tunnelInstances.accessViaIAP` — that's what this step needs to open
+the tunnel.
 
 Short version of the design: the script notifies Telegram from a
 root-only local secret file rather than calling Secret Manager directly,
@@ -163,8 +176,8 @@ Secret Manager. See server-setup.md for the full rationale and steps.
 
 ## Not needed
 
-- No changes to the `ai-dev-vps` instance itself — the function only needs
-  `start`/`stop` permission on it via IAM, granted by Terraform.
+- No manual SSH/scp to the instance — `terraform apply` handles the
+  idle-shutdown + Telegram-notify setup itself (§6).
 - No manual secret creation — Terraform creates both Secret Manager
   entries; you're only supplying the raw bot token value as a tfvar.
 - No manual webhook registration — that's a `curl` call after `apply`,

@@ -1,82 +1,76 @@
 # Server setup: idle-shutdown + Telegram notify
 
-How to install the auto-shutdown cron and its Telegram notification on the
-`ai-dev-vps` instance. This is a manual, one-time step per VM — it isn't
-managed by the `terraform/` module (that module only grants the Cloud
-Function IAM permission to start/stop the instance by name; it doesn't
-touch the instance's own filesystem or cron).
+Installs the auto-shutdown cron and its Telegram notification on the
+target instance. This runs automatically as part of `terraform apply` —
+`terraform/vm_setup.tf`'s `null_resource.vm_setup` calls
+`scripts/ansible-provision.sh`, which runs `ansible/playbook.yml` against
+the instance over an IAP-tunneled SSH connection.
 
-Verified working end-to-end against a real deployment (`ai-vps-503813`)
-before being written up here.
+The VM itself is still not a Terraform-*managed* resource (see
+`function.tf`/`iam.tf` — those only grant the Cloud Function's service
+account permission to start/stop it by name), so this reaches it
+out-of-band via Ansible rather than a native `google_compute_instance`
+resource. Verified working end-to-end, including idempotency on a second
+apply, against a real deployment (`ai-vps-503813`).
 
-## Prerequisites
+## How it works
 
-- The target VM exists and you can reach it: `gcloud compute ssh
-  <instance> --project=<PROJECT_ID> --zone=<ZONE> --tunnel-through-iap`
-- The Terraform stack in `terraform/` is already applied — you'll reuse
-  the same bot token and chat ID from `terraform.tfvars` here.
+| Piece | Role |
+|---|---|
+| `ansible/playbook.yml` | Copies `scripts/idle-shutdown.sh` to `/home/mike/infra/`, templates `/etc/telegram-notify.env` (root-only, `chmod 600`), and installs the idle-shutdown cron job — all idempotent. |
+| `ansible/templates/telegram-notify.env.j2` | Renders the secret file from `telegram_bot_token`/`telegram_chat_id` extra-vars. Task is `no_log: true` so the token never hits Ansible's output. |
+| `ansible/inventory.ini` | Static, points at `127.0.0.1:2222` — no secrets or per-environment values, since the wrapper script always forwards the tunnel to that fixed local port. |
+| `scripts/ansible-provision.sh` | Starts an IAP tunnel in the background on port 2222, waits for it, runs the playbook, tears the tunnel down on exit. |
+| `terraform/vm_setup.tf` | Triggers the script whenever the playbook, template, script, bot token, chat ID, or instance name change. |
 
-## 1. Copy the script to the VM
-
-```
-gcloud compute scp scripts/idle-shutdown.sh \
-  <instance>:/tmp/idle-shutdown.sh \
-  --project=<PROJECT_ID> --zone=<ZONE> --tunnel-through-iap
-
-gcloud compute ssh <instance> --project=<PROJECT_ID> --zone=<ZONE> --tunnel-through-iap --command='
-  sudo mkdir -p /home/mike/infra
-  sudo mv /tmp/idle-shutdown.sh /home/mike/infra/idle-shutdown.sh
-  sudo chmod +x /home/mike/infra/idle-shutdown.sh
-  sudo chown root:root /home/mike/infra/idle-shutdown.sh
-'
-```
-
-(Adjust `/home/mike/infra` if the VM uses a different convention — the
-crontab entry in step 3 just needs to match wherever you put it.)
-
-## 2. Create the Telegram secret file
-
-Copy `scripts/telegram-notify.env.example`, fill in the same bot token
-and chat ID used in `terraform.tfvars`, and install it root-owned and
-unreadable by anyone else:
-
-```
-gcloud compute ssh <instance> --project=<PROJECT_ID> --zone=<ZONE> --tunnel-through-iap --command='
-  sudo install -m 600 -o root -g root /dev/null /etc/telegram-notify.env
-  sudo tee /etc/telegram-notify.env >/dev/null <<EOF
-TELEGRAM_BOT_TOKEN=<same token as terraform.tfvars telegram_bot_token>
-TELEGRAM_CHAT_ID=<same value as terraform.tfvars allowed_chat_id>
-EOF
-'
-```
-
-Why a second copy of the token instead of reading it from Secret Manager:
-the VM's default service account typically has legacy OAuth scopes
-(`devstorage.read_only`, `logging.write`, etc.) rather than
+Why a second copy of the bot token instead of reading it from Secret
+Manager: the VM's default service account typically has legacy OAuth
+scopes (`devstorage.read_only`, `logging.write`, etc.) rather than
 `cloud-platform`, which Secret Manager calls require. Widening the scope
 means detaching and reattaching the service account, which requires
 stopping the instance — more disruptive than a second, VM-local secret
 file for this use case.
 
-## 3. Install the cron job
+Why Ansible reaches the VM through a backgrounded, fixed-port tunnel
+instead of the more commonly documented `ProxyCommand="gcloud compute
+start-iap-tunnel %h %p --listen-on-stdin ..."` pattern: this environment's
+gcloud SDK (560.0.0) has no `--listen-on-stdin` flag on
+`start-iap-tunnel` (checked `--help` on the stable, `alpha`, and `beta`
+variants). The fixed-port approach is a couple more moving parts but
+doesn't depend on a flag that may not exist in every gcloud version.
+
+## Prerequisites
+
+- `ansible-core` installed locally (alongside `terraform`/`gcloud`) —
+  wherever `terraform apply` runs.
+- The target VM exists and is `RUNNING` — `ansible-provision.sh` checks
+  this and fails fast with a clear message otherwise, rather than hanging
+  on a dead tunnel.
+- The identity running `terraform apply` can reach the instance via IAP
+  (needs `roles/iap.tunnelResourceAccessor` if not using the owner
+  account — see `gce-admin-prep.md` §3).
+- `gcloud compute ssh` has been run at least once with this identity, so
+  `~/.ssh/google_compute_engine` exists and the key is propagated to the
+  instance.
+
+## Running it standalone
+
+Useful for debugging without going through a full `terraform apply`:
 
 ```
-gcloud compute ssh <instance> --project=<PROJECT_ID> --zone=<ZONE> --tunnel-through-iap --command='
-  (sudo crontab -l 2>/dev/null; echo "* * * * * /home/mike/infra/idle-shutdown.sh") | sudo crontab -
-'
+PROJECT_ID=<PROJECT_ID> ZONE=<ZONE> INSTANCE_NAME=<instance> \
+  BOT_TOKEN=<telegram_bot_token> CHAT_ID=<allowed_chat_id> \
+  ./scripts/ansible-provision.sh
 ```
 
-`IDLE_MINUTES` defaults to 30 inside the script; override by exporting it
-before the cron line if you want a different threshold, e.g.:
-`*/1 * * * * IDLE_MINUTES=10 /home/mike/infra/idle-shutdown.sh`.
+## Verify
 
-## 4. Verify
-
-Check the crontab is in place and the script is logging each run:
+Check the crontab and files landed correctly:
 
 ```
 gcloud compute ssh <instance> --project=<PROJECT_ID> --zone=<ZONE> --tunnel-through-iap --command='
   sudo crontab -l
+  sudo ls -la /etc/telegram-notify.env /home/mike/infra/idle-shutdown.sh
   sudo tail -5 /var/log/idle-shutdown.log
 '
 ```
