@@ -2,10 +2,10 @@
 
 Infra plan — finalized after review. Not yet applied to infrastructure.
 
-A Cloud Run function accepts inline-button taps from one authorized Telegram
-user and starts or stops the `ai-dev-vps` Compute Engine instance. This
-revision closes an auth gap present in the first draft and moves secrets out
-of Terraform state.
+A Cloud Run function accepts reply-keyboard button taps from one authorized
+Telegram user and starts or stops the `ai-dev-vps` Compute Engine instance.
+This revision closes an auth gap present in the first draft and moves
+secrets out of Terraform state.
 
 **Decisions locked in:**
 
@@ -23,14 +23,13 @@ of Terraform state.
 You, in Telegram                Cloud Run function                ai-dev-vps
 Taps "Power On" /      --HTTPS POST-->   Checks, in order:     --compute.instances-->   e2-medium Compute
 "Power Off" on the      + secret header   1. secret_token header   start / stop          Engine instance,
-inline keyboard                           2. allowed chat_id                              unchanged
-                                           3. message vs callback_query
+reply keyboard                            2. allowed chat_id                              unchanged
+                                           3. text matches a known button label
 ```
 
-The function also writes back to Telegram directly — `answerCallbackQuery`
-to clear the button's spinner, then `sendMessage` to confirm the action —
-so traffic runs in both directions even though the diagram only draws it
-once.
+The function also writes back to Telegram directly via `sendMessage` to
+confirm the action, so traffic runs in both directions even though the
+diagram only draws it once.
 
 ---
 
@@ -38,9 +37,9 @@ once.
 
 **Gap in v1:** The draft's only gate was `chat_id != allowed_chat_id` — but
 `chat_id` is a field inside the request body, and the endpoint has no auth
-in front of it. Anyone who finds the function URL can POST a forged
-`callback_query` with your `chat_id` in it and drive the VM directly. The
-allowlist checked the wrong layer.
+in front of it. Anyone who finds the function URL can POST a forged update
+with your `chat_id` in it and drive the VM directly. The allowlist checked
+the wrong layer.
 
 **Fix:** Telegram's `setWebhook` accepts a `secret_token`, which it then
 echoes back on every call as the `X-Telegram-Bot-Api-Secret-Token` header.
@@ -68,7 +67,9 @@ Structural changes from the draft: the secret-token check runs first and
 unconditionally; `get_json` is guarded so a malformed body can't throw
 before the checks run; Compute API calls are wrapped so a double-tap (VM
 already on/off) sends a message instead of a 500 that makes Telegram retry
-the whole webhook.
+the whole webhook. Buttons are a persistent reply keyboard rather than an
+inline keyboard, so taps arrive as ordinary `message` updates — there's no
+`callback_query` branch and no `answerCallbackQuery` spinner to clear.
 
 ### main.py
 
@@ -91,11 +92,13 @@ ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
+POWER_ON_LABEL = "Power On \U0001F7E2"
+POWER_OFF_LABEL = "Power Off \U0001F534"
+
 KEYBOARD = {
-    "inline_keyboard": [[
-        {"text": "Power On \U0001F7E2", "callback_data": "power_on"},
-        {"text": "Power Off \U0001F534", "callback_data": "power_off"},
-    ]]
+    "keyboard": [[{"text": POWER_ON_LABEL}, {"text": POWER_OFF_LABEL}]],
+    "resize_keyboard": True,
+    "is_persistent": True,
 }
 
 
@@ -111,30 +114,28 @@ def telegram_webhook(request):
 
     data = request.get_json(silent=True) or {}
 
-    if "callback_query" in data:
-        return _handle_callback(data["callback_query"])
-
     if "message" in data and "text" in data["message"]:
         return _handle_message(data["message"])
 
     return "OK", 200
 
 
-def _handle_callback(callback_query):
-    chat_id = callback_query["message"]["chat"]["id"]
+def _handle_message(message):
+    chat_id = message["chat"]["id"]
     if chat_id != ALLOWED_CHAT_ID:
         return "Forbidden", 403
 
-    requests.post(
-        API_URL + "answerCallbackQuery",
-        json={"callback_query_id": callback_query["id"]},
-        timeout=5,
-    )
+    text = message["text"]
 
-    action = callback_query.get("data")
-    if action == "power_on":
+    if text in ("/start", "/control"):
+        requests.post(
+            API_URL + "sendMessage",
+            json={"chat_id": chat_id, "text": "Server Control Panel:", "reply_markup": KEYBOARD},
+            timeout=5,
+        )
+    elif text == POWER_ON_LABEL:
         _run_power_action(compute_client.start, chat_id, "\U0001F7E2 Booting up AI VPS...")
-    elif action == "power_off":
+    elif text == POWER_OFF_LABEL:
         _run_power_action(compute_client.stop, chat_id, "\U0001F534 Shutting down AI VPS...")
 
     return "OK", 200
@@ -148,21 +149,6 @@ def _run_power_action(method, chat_id, ok_text):
         text = f"⚠️ Compute API error: {exc.message}"
 
     requests.post(API_URL + "sendMessage", json={"chat_id": chat_id, "text": text}, timeout=5)
-
-
-def _handle_message(message):
-    chat_id = message["chat"]["id"]
-    if chat_id != ALLOWED_CHAT_ID:
-        return "Forbidden", 403
-
-    if message["text"] in ("/start", "/control"):
-        requests.post(
-            API_URL + "sendMessage",
-            json={"chat_id": chat_id, "text": "Server Control Panel:", "reply_markup": KEYBOARD},
-            timeout=5,
-        )
-
-    return "OK", 200
 ```
 
 ### requirements.txt
@@ -379,7 +365,7 @@ output "webhook_secret_token" {
         "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook"
    ```
 4. **Verify.** Message `/start` to the bot from the allowed account,
-   confirm the inline keyboard appears, and tap Power Off / Power On once
+   confirm the reply keyboard appears, and tap Power Off / Power On once
    each against a low-stakes moment to confirm the VM actually transitions.
 
 ---
@@ -391,8 +377,14 @@ Values and calls only you can make before this ships:
 - [ ] GCP project ID, region, and zone for `ai-dev-vps`
 - [ ] Your numeric Telegram chat ID (get it from `@userinfobot` or the
       bot's own update log)
-- [ ] Whether the existing auto-shutdown cron on the VM should also notify
+- [x] Whether the existing auto-shutdown cron on the VM should also notify
       Telegram when it fires, so the two control paths don't feel
-      disconnected
-- [ ] Whether `terraform.tfvars` / state will live somewhere with a remote
-      backend, or stay local for now
+      disconnected — **resolved: yes**, see
+      [gce-admin-prep.md §6](gce-admin-prep.md#6-wire-the-auto-shutdown-cron-to-notify-telegram)
+      for the pattern (a local root-only secret file, not a Secret
+      Manager call, since the VM's default service account lacks the
+      OAuth scope for that without a restart).
+- [x] Whether `terraform.tfvars` / state will live somewhere with a remote
+      backend, or stay local for now — **resolved: local state** for now.
+      The scaffold in `terraform/` uses no backend block, so state is a
+      local `terraform.tfstate` file (gitignored).
